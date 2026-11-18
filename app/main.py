@@ -2,19 +2,21 @@
 
 Endpoints
 ---------
-POST /jobs                 submit 1..10 statements (queued, 202)
-GET  /jobs                 list recent jobs
-GET  /jobs/{id}            job detail incl. per-statement results
-POST /jobs/{id}/cancel     cancel a queued/running job (202) ; 409 if finished
-GET  /pool                 state of the two pooled connections
-GET  /health               liveness
-GET  /docs                 Swagger UI
+POST /jobs                       submit 1..10 statements (queued, 202)
+GET  /jobs                       list recent jobs
+GET  /jobs/{id}                  job detail incl. per-statement results
+POST /jobs/{id}/cancel           cancel a queued/running job (202) ; 409 if finished
+POST /maintenance/partitions/backfill  create missing daily RANGE partitions
+GET  /pool                       state of the two pooled connections
+GET  /health                     liveness
+GET  /docs                       Swagger UI
 """
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
 
+import anyio
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 
@@ -24,10 +26,13 @@ from .models import (
     CancelResponse,
     JobDetail,
     JobSummary,
+    PartitionBackfillRequest,
+    PartitionBackfillResponse,
     PoolStatus,
     SubmitRequest,
     SubmitResponse,
 )
+from .partitions import PartitionError, backfill_partitions
 from .pool import Pool
 from .sqlguard import SqlRejected, check_statements
 from .store import TERMINAL_STATES, Job, JobStore, utcnow
@@ -177,3 +182,40 @@ def cancel_job(job_id: str, req: CancelRequest | None = None):
 @app.get("/pool", response_model=PoolStatus)
 def pool_status():
     return pool.status()
+
+
+@app.post(
+    "/maintenance/partitions/backfill",
+    response_model=PartitionBackfillResponse,
+    summary="Backfill missing daily RANGE partitions (all-or-nothing batch)",
+    responses={
+        409: {
+            "description": "Conflict: a requested day is covered by an "
+            "incompatible existing partition, or the parent table is locked "
+            "by another session (retry). Nothing was created.",
+        },
+        422: {"description": "Unsupported table shape or invalid request."},
+        500: {"description": "DDL failed; the whole batch was rolled back."},
+    },
+)
+async def backfill_daily_partitions(req: PartitionBackfillRequest):
+    """Create the missing daily partitions for an inclusive date range.
+
+    Only single-level, single-column ``DATE RANGE`` partitioned tables
+    without a DEFAULT partition are accepted. Partitions whose bounds are
+    exactly ``[day, day+1)`` are reused; missing days are created in one
+    transaction on a dedicated maintenance connection. A day covered by a
+    wider/straddling existing partition rejects the whole batch (409).
+    """
+    try:
+        # Blocking psycopg work: keep it off the event loop.
+        result = await anyio.to_thread.run_sync(
+            backfill_partitions,
+            req.schema_name,
+            req.table_name,
+            req.start_date,
+            req.end_date,
+        )
+    except PartitionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    return result

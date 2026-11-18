@@ -76,3 +76,34 @@ curl -s -o /dev/null -w "cancel after finish -> HTTP %{http_code}\n" \
 echo
 echo "=== 6) explicit transaction control is rejected (422) ==="
 curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{"statements": ["BEGIN", "SELECT 1"]}' | pp
+
+echo
+echo "=== 7) daily partition backfill (independent maintenance connection) ==="
+# prepare a single-column DATE RANGE parent with one exact-day partition
+curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{"statements": [
+  "CREATE SCHEMA IF NOT EXISTS demo_part",
+  "DROP TABLE IF EXISTS demo_part.events",
+  "CREATE TABLE demo_part.events (id int, log_date date) PARTITION BY RANGE (log_date)",
+  "CREATE TABLE demo_part.events_20261120 PARTITION OF demo_part.events FOR VALUES FROM ('"'"'2026-11-20'"'"') TO ('"'"'2026-11-21'"'"')"
+]}' >/dev/null
+sleep 1
+echo "-- backfill 11-18..11-21: 18/19/21 created, 20 reused:"
+curl -s -XPOST "$BASE/maintenance/partitions/backfill" -H "$JSON" -d '{
+  "schema_name": "demo_part",
+  "table_name": "events",
+  "start_date": "2026-11-18",
+  "end_date": "2026-11-21"
+}' | pp
+echo "-- retry: all four now reported as reused, nothing created twice:"
+curl -s -XPOST "$BASE/maintenance/partitions/backfill" -H "$JSON" -d '{
+  "schema_name": "demo_part",
+  "table_name": "events",
+  "start_date": "2026-11-18",
+  "end_date": "2026-11-21"
+}' | pp
+echo "-- the backfilled dates accept inserts immediately:"
+curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{"statements": [
+  "INSERT INTO demo_part.events VALUES (1,'"'"'2026-11-18'"'"'),(2,'"'"'2026-11-21'"'"')",
+  "SELECT tableoid::regclass AS partition, count(*) FROM demo_part.events GROUP BY 1 ORDER BY 1"
+]}' >/dev/null
+sleep 1

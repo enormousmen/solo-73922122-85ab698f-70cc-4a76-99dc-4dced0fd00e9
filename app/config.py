@@ -37,3 +37,19 @@ MAX_HOOK_DELAY_MS: int = int(os.environ.get("MAX_HOOK_DELAY_MS", "120000"))
 CANCEL_SEND_WAIT_S: float = float(os.environ.get("CANCEL_SEND_WAIT_S", "180"))
 
 CONNECT_TIMEOUT_S: int = int(os.environ.get("CONNECT_TIMEOUT_S", "10"))
+
+# ---- partition backfill endpoint ---------------------------------------
+# Maintenance DDL runs on its OWN short-lived connection per request, never
+# on one of the two diagnostic long connections.
+PARTITION_MAX_DAYS: int = int(os.environ.get("PARTITION_MAX_DAYS", "7"))
+# Abort rather than wait forever behind another DDL session holding the
+# parent table. On timeout the whole batch fails and nothing is created;
+# the caller may retry (pre-existing partitions are reported as "reused").
+PARTITION_LOCK_TIMEOUT_MS: int = int(
+    os.environ.get("PARTITION_LOCK_TIMEOUT_MS", "10000")
+)
+PARTITION_STATEMENT_TIMEOUT_MS: int = int(
+    os.environ.get("PARTITION_STATEMENT_TIMEOUT_MS", "30000")
+)
+# Hard cap on identifier length in PostgreSQL.
+MAX_IDENTIFIER_LEN: int = 63

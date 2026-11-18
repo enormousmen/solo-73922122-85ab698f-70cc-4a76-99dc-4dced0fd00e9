@@ -1,7 +1,9 @@
 """Pydantic request/response models (also drive the /docs schema)."""
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from datetime import date
+
+from pydantic import BaseModel, Field, field_validator
 
 from . import config
 
@@ -111,3 +113,62 @@ class PoolStatus(BaseModel):
     size: int
     queue_depth: int
     connections: list[ConnectionStatus]
+
+
+# ---- partition backfill --------------------------------------------------
+
+
+class PartitionBackfillRequest(BaseModel):
+    schema_name: str = Field(
+        min_length=1,
+        max_length=63,
+        description="Schema of the parent table, e.g. 'app'.",
+    )
+    table_name: str = Field(
+        min_length=1,
+        max_length=63,
+        description="Parent table partitioned by RANGE on a single DATE "
+        "column, without a DEFAULT partition.",
+    )
+    start_date: date = Field(
+        description="First day to cover (inclusive).",
+    )
+    end_date: date = Field(
+        description="Last day to cover (inclusive). The range spans at most "
+        f"{config.PARTITION_MAX_DAYS} days.",
+    )
+
+    @field_validator("schema_name", "table_name")
+    @classmethod
+    def _no_dots(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        # Identifiers are passed through psycopg Identifier(), which itself
+        # rejects dots; fail early with a clear 422.
+        if "." in v or '"' in v or "\x00" in v:
+            raise ValueError(
+                "must be a plain identifier (no dots, quotes or NUL bytes)"
+            )
+        return v
+
+
+class PartitionDayEntry(BaseModel):
+    date: str
+    partition: str
+    bounds: dict[str, str] | None = None
+
+
+class PartitionReuseEntry(BaseModel):
+    date: str
+    partition: str
+
+
+class PartitionBackfillResponse(BaseModel):
+    schema_name: str
+    table_name: str
+    range: dict[str, str]
+    created: list[PartitionDayEntry]
+    reused: list[PartitionReuseEntry]
+    created_count: int
+    reused_count: int

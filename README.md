@@ -57,9 +57,70 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diag \
 | GET | `/jobs` | 最近的单（摘要列表） |
 | GET | `/jobs/{id}` | 单详情 + 逐句结果（状态/列/行/rowcount/耗时/错误） |
 | POST | `/jobs/{id}/cancel` | 取消未结束的单（202 受理；已结束返回 409） |
+| POST | `/maintenance/partitions/backfill` | 补建缺失的日 RANGE 分区（整批事务，见下） |
 | GET | `/pool` | 两条连接的状态（idle/busy/cleaning/reconnecting、代数、清理失败数） |
 | GET | `/health` | 存活检查 |
 | GET | `/docs` | Swagger UI |
+
+## 日分区补建（`POST /maintenance/partitions/backfill`）
+
+按日入库的 RANGE 分区表在缺少对应日期的子分区时写入会失败。该端点为值班
+工程师一次性补建一个日期范围内缺失的**日分区**。
+
+### 适用范围（不满足即 422，且不执行任何 DDL）
+
+- 父表为**单层、单列、键类型为 `date` 的 RANGE 分区**；
+- **没有 DEFAULT 分区**；
+- LIST/HASH 分区、非 `date` 键、多列键、普通表、二级分区、自身是分区的表一律拒绝；
+- 日期范围闭区间，**最多 7 天**（`PARTITION_MAX_DAYS` 可调），`end_date` 不得早于 `start_date`。
+
+### 语义
+
+- **沿用**：已存在且边界恰好为 `[当日, 次日)` 的分区直接复用，响应里记为 `reused`；
+- **新建**：没有任何分区覆盖的日期，创建名为 `<表名>_YYYYMMDD` 的日分区，记为 `created`；
+- **整批冲突**：某天落入边界**不是** `[当日, 次日)` 的跨日旧分区时，整批返回 409，
+  保持原状、不建任何分区；
+- **全有或全无**：整批在**一个事务**内完成；任一天冲突或创建失败，整批回滚，不留半成品；
+- **可重试且可区分**：重试时在同一把锁内重新读目录，已存在的（含本次之前建的）一律
+  报 `reused`，本次新建的才报 `created`；
+- **立即可用**：提交成功后这些日期即可正常入库。
+
+### 并发与隔离
+
+- 每个请求使用**独立的短连接**（`autocommit=False` 的单事务），**绝不占用**两条诊断
+  长连接；两条诊断连接的执行与取消不受维护操作影响（`/pool` 始终只有两条）。
+- 事务内先 `LOCK TABLE ... IN SHARE UPDATE EXCLUSIVE`，而
+  `CREATE TABLE ... PARTITION OF` 需要 AccessExclusiveLock，两者互斥；因此与其他补建
+  请求或手工 DDL 交错时，同一天**不可能建出两个分区**。
+- 等锁受 `lock_timeout`（默认 10s）保护，超时返回 409 提示稍后重试，不留任何改动。
+
+### 请求/响应示例
+
+```bash
+curl -XPOST localhost:8000/maintenance/partitions/backfill \
+  -H 'content-type: application/json' -d '{
+    "schema_name": "app",
+    "table_name": "events",
+    "start_date": "2026-11-18",
+    "end_date": "2026-11-21"
+  }'
+```
+
+```json
+{
+  "schema_name": "app", "table_name": "events",
+  "range": {"start": "2026-11-18", "end": "2026-11-21"},
+  "created": [
+    {"date": "2026-11-18", "partition": "events_20261118",
+     "bounds": {"from": "2026-11-18", "to": "2026-11-19"}}
+  ],
+  "reused": [{"date": "2026-11-20", "partition": "events_20261120"}],
+  "created_count": 1, "reused_count": 1
+}
+```
+
+标识符经 psycopg `Identifier` 转义、日期字面量经 `Literal` 转义；schema/表名仅接受
+不含 `.`、引号、NUL 的普通标识符。
 
 ### 提交
 
@@ -113,13 +174,19 @@ pip install -r requirements-dev.txt
 pytest tests/test_sqlguard.py        # 纯单元测试（SQL 守卫），无需数据库
 # 集成测试需要运行中的服务与数据库：
 API_BASE=http://localhost:8000 TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diag \
-  pytest tests/test_integration.py
+  pytest tests/test_integration.py tests/test_partitions.py
 ```
 
 集成测试覆盖：按序自动提交与逐句结果、行数截断、失败即停、参数校验、
 会话状态不泄漏（SET/临时表/咨询锁/预备语句，含失败单）、取消运行中/排队中的单、
 迟到取消（409 与延迟发送不误伤下一单）、慢 SQL/慢清理不阻塞另一连接、
 清理失败淘汰并补建连接（钩子注入 + `pg_terminate_backend` 真实杀连接两种）。
+
+分区补建测试（`tests/test_partitions.py`）覆盖：缺失新建与精确日分区沿用、
+单日/恰好 7 天范围、成功后立即入库、重试区分 `created`/`reused`、跨日旧分区整批 409
+且保持原状、DEFAULT/LIST/非 date 键/多列/普通表/二级分区等形状拒绝、超过 7 天与
+日期非法等请求校验、批次中途失败整批回滚不留分区、独立连接（两条诊断连接忙时仍可用）、
+同表并发每天只建一个分区、手工 DDL 交错不重复。
 
 > 注：PostgreSQL 的语句取消依赖向后端进程投递 SIGINT。在禁止进程间信号的
 > 沙箱里，"中断正在执行的语句"无法生效（`pg_terminate_backend` 同样无效），
@@ -135,3 +202,12 @@ API_BASE=http://localhost:8000 TEST_DATABASE_URL=postgresql://postgres:postgres@
 - 单进程单实例：连接池在进程内，勿以多 worker 方式启动 uvicorn。
 - 连接使用 `prepare_threshold=None`，避免 psycopg 的客户端预备语句缓存与
   清理中的 `DEALLOCATE ALL` 冲突。
+- 分区补建的维护连接是每请求新建、用完即关的短连接，与诊断连接池完全独立；
+  阻塞的 psycopg 调用经 `anyio.to_thread` 在线程中执行，不阻塞事件循环。
+
+> 锁与信号环境说明：分区补建依赖 PostgreSQL 的锁等待唤醒与 `lock_timeout`
+> （后者通过向后端进程投递信号中断等待）。在禁止进程间信号/IPC 的沙箱里，
+> 多个会话同时阻塞等待同一父表锁时可能无法被及时唤醒。`tests/test_partitions.py`
+> 的强锁串行用例会先探测该能力，缺失时自动跳过（无竞争的并发、原子性、形状校验等
+> 用例不受影响）；在 Docker/正常 Linux 下该用例完整执行。锁互斥本身
+> （SUE 与 CREATE PARTITION 的 AccessExclusiveLock 冲突）是 PostgreSQL 的确定行为。
